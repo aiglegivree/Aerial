@@ -541,7 +541,7 @@ class CrazyflieInDroneDome(Supervisor):
 
         # Convert the image to a numpy array for OpenCV
         image = np.frombuffer(camera_image, np.uint8).reshape((self.camera.getHeight(), self.camera.getWidth(), 4))
-
+        
         return image
     
     # Detect which segment the drone is in
