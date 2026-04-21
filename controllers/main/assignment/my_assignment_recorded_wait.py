@@ -30,39 +30,40 @@ class MyAssignment:
         self.pass_through_altitude = self.cruise_altitude
         self.advance_timer = 0.0
         self.camera_half_fov = np.deg2rad(35.0)
-        self.camera_fov = 1.5
-        self.camera_offset_body = np.array([0.03, 0.0, 0.01], dtype=float)
-        self.camera_to_body = np.array(
-            [
-                [0.0, 0.0, 1.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0],
-            ],
-            dtype=float,
-        )
         self.gate_real_height = 0.4
         self.gate_focal_px = 320.0
         self.pending_gate_samples = []
-        self.gate_bearing_observations = []
-        self.min_triangulation_observations = 12
-        self.max_triangulation_observations = 40
-        self.min_triangulation_baseline = 0.6
-        self.gate_center_backoff = 0.35
-        self.replay_approach_distance = 0.7
-        self.first_gate_approach_distance = 1.1
-        self.first_gate_exit_distance = 0.45
+        self.min_gate_samples_to_store = 4
+        self.post_gate_backoff = 0.35
+        self.peak_gate_area = 0.0
+        self.peak_gate_sample = None
+        self.peak_gate_sensor = None
+        self.peak_area_drop_to_store = 0.003
 
         self.learned_gates = []
         self.expected_gate_count = 5
+        self.replay_gate_index = 0
         self.replay_lap = 0
         self.total_replay_laps = 2
         self.replay_trajectory = []
-        self.replay_trajectory_types = []
         self.replay_traj_index = 0
-        self.last_printed_replay_type = None
         self.replay_traj_tol = 0.55
-        self.replay_gate_tol = 0.4
-        self.replay_speed_scale = 1.0
+        self.replay_speed_scale = 2
+        self.recorded_positions = []
+        self.recorded_index = 0
+        self.recorded_cycle = 0
+        self.total_recorded_cycles = 1
+        self.recorded_position_tol = 0.35
+        self.recorded_speed_scale = 1.4
+        self.recorded_wait_seconds = 3.0
+        self.recorded_wait_timer = 0.0
+
+        self.locked_center = None
+        self.locked_area = None
+        self.locked_frames = 0
+        self.switch_candidate_center = None
+        self.switch_candidate_area = None
+        self.switch_candidate_frames = 0
 
     def reset_search_pattern(self, current_yaw=None):
         self.scan_phase = 0.0
@@ -116,23 +117,31 @@ class MyAssignment:
                     "area_rel": float(area_rel),
                     "pixel_height": pixel_height,
                     "center_px": (center_x, center_y),
-                    "image_shape": (height, width),
                 }
             )
 
         return sorted(candidates, key=lambda item: item["area_rel"], reverse=True)
-
     def choose_gate_candidate(self, candidates, sensor_data):
         if not candidates:
+            self.locked_frames = 0
+            self.switch_candidate_center = None
+            self.switch_candidate_area = None
+            self.switch_candidate_frames = 0
             return None
         del sensor_data
         rightmost = max(candidates, key=lambda item: item["center_px"][0])
         largest = max(candidates, key=lambda item: item["area_rel"])
-        if largest["area_rel"] >= 1.3 * rightmost["area_rel"]:
+        if largest["area_rel"] >= 1.2 * rightmost["area_rel"]:
             chosen = largest
         else:
             chosen = rightmost
 
+        self.locked_center = chosen["center_px"]
+        self.locked_area = chosen["area_rel"]
+        self.locked_frames = 1
+        self.switch_candidate_center = None
+        self.switch_candidate_area = None
+        self.switch_candidate_frames = 0
         return chosen
 
     def gate_world_estimate(self, sensor_data, error):
@@ -145,61 +154,31 @@ class MyAssignment:
         gate_z = sensor_data["z_global"]
         return [float(gate_x), float(gate_y), float(gate_z)]
 
-    def body_to_world_rotation(self, sensor_data):
-        roll = sensor_data["roll"]
-        pitch = sensor_data["pitch"]
-        yaw = sensor_data["yaw"]
-        cr, sr = np.cos(roll), np.sin(roll)
-        cp, sp = np.cos(pitch), np.sin(pitch)
-        cy, sy = np.cos(yaw), np.sin(yaw)
+    def pre_gate_world_estimate(self, sensor_data, gate_position):
+        gate_xy = np.array(gate_position[:2], dtype=float)
+        drone_xy = np.array([sensor_data["x_global"], sensor_data["y_global"]], dtype=float)
+        approach_vector = gate_xy - drone_xy
+        norm = np.linalg.norm(approach_vector)
+        if norm < 1e-6:
+            direction = np.array([np.cos(sensor_data["yaw"]), np.sin(sensor_data["yaw"])], dtype=float)
+        else:
+            direction = approach_vector / norm
 
-        r_x = np.array(
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, cr, -sr],
-                [0.0, sr, cr],
-            ],
-            dtype=float,
-        )
-        r_y = np.array(
-            [
-                [cp, 0.0, sp],
-                [0.0, 1.0, 0.0],
-                [-sp, 0.0, cp],
-            ],
-            dtype=float,
-        )
-        r_z = np.array(
-            [
-                [cy, -sy, 0.0],
-                [sy, cy, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        )
-        return r_z @ r_y @ r_x
+        pre_gate_xy = gate_xy - 0.8 * direction
+        return [float(pre_gate_xy[0]), float(pre_gate_xy[1]), float(gate_position[2])]
 
-    def camera_ray_world(self, sensor_data, error):
-        height, width = error["image_shape"]
-        center_x, center_y = error["center_px"]
-        focal_px = width / (2.0 * np.tan(self.camera_fov / 2.0))
-        pixel_x = center_x - width / 2.0
-        pixel_y = center_y - height / 2.0
+    def earlier_gate_position(self, sensor_data, gate_position, backoff):
+        gate_xy = np.array(gate_position[:2], dtype=float)
+        drone_xy = np.array([sensor_data["x_global"], sensor_data["y_global"]], dtype=float)
+        approach_vector = gate_xy - drone_xy
+        norm = np.linalg.norm(approach_vector)
+        if norm < 1e-6:
+            direction = np.array([np.cos(sensor_data["yaw"]), np.sin(sensor_data["yaw"])], dtype=float)
+        else:
+            direction = approach_vector / norm
 
-        ray_camera = np.array([pixel_x, pixel_y, focal_px], dtype=float)
-        ray_body = self.camera_to_body @ ray_camera
-        rotation_body_to_world = self.body_to_world_rotation(sensor_data)
-        ray_world = rotation_body_to_world @ ray_body
-        ray_norm = np.linalg.norm(ray_world)
-        if ray_norm < 1e-6:
-            return None
-
-        drone_position = np.array(
-            [sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"]],
-            dtype=float,
-        )
-        camera_origin = drone_position + rotation_body_to_world @ self.camera_offset_body
-        return camera_origin, ray_world / ray_norm
+        earlier_xy = gate_xy - backoff * direction
+        return [float(earlier_xy[0]), float(earlier_xy[1]), float(gate_position[2])]
 
     def collect_gate_sample(self, sensor_data, error):
         if len(self.learned_gates) >= self.expected_gate_count:
@@ -207,105 +186,81 @@ class MyAssignment:
 
         candidate = self.gate_world_estimate(sensor_data, error)
         self.pending_gate_samples.append(candidate)
-        if len(self.pending_gate_samples) > 12:
-            self.pending_gate_samples = self.pending_gate_samples[-12:]
+        if len(self.pending_gate_samples) > 8:
+            self.pending_gate_samples = self.pending_gate_samples[-8:]
 
-        ray = self.camera_ray_world(sensor_data, error)
-        if ray is None:
-            return
-        camera_origin, ray_direction = ray
-        centered_score = max(0.05, 1.0 - abs(error["dx"]))
-        area_score = max(error["area_rel"], 1e-4)
-        self.gate_bearing_observations.append(
-            {
-                "origin": camera_origin,
-                "direction": ray_direction,
-                "weight": float(area_score * centered_score * centered_score),
+        if error["area_rel"] > self.peak_gate_area:
+            self.peak_gate_area = error["area_rel"]
+            self.peak_gate_sample = candidate
+            self.peak_gate_sensor = {
+                "x_global": sensor_data["x_global"],
+                "y_global": sensor_data["y_global"],
+                "yaw": sensor_data["yaw"],
             }
+
+    def reset_gate_peak(self):
+        self.peak_gate_area = 0.0
+        self.peak_gate_sample = None
+        self.peak_gate_sensor = None
+
+    def store_gate_candidate(self, sensor_data, raw_post_gate_candidate):
+        post_gate_candidate = self.earlier_gate_position(
+            sensor_data,
+            raw_post_gate_candidate,
+            self.post_gate_backoff,
         )
-        if len(self.gate_bearing_observations) > self.max_triangulation_observations:
-            self.gate_bearing_observations = self.gate_bearing_observations[-self.max_triangulation_observations:]
-
-    def reset_gate_localization(self):
-        self.pending_gate_samples = []
-        self.gate_bearing_observations = []
-
-    def triangulate_gate_position(self):
-        if len(self.gate_bearing_observations) < self.min_triangulation_observations:
-            return None
-
-        origins = np.array([obs["origin"] for obs in self.gate_bearing_observations], dtype=float)
-        baseline = np.max(np.linalg.norm(origins - np.mean(origins, axis=0), axis=1))
-        if baseline < self.min_triangulation_baseline:
-            return None
-
-        a_matrix = np.zeros((3, 3), dtype=float)
-        b_vector = np.zeros(3, dtype=float)
-        weight_sum = 0.0
-        identity = np.eye(3, dtype=float)
-
-        for obs in self.gate_bearing_observations:
-            direction = obs["direction"]
-            norm = np.linalg.norm(direction)
-            if norm < 1e-6:
-                continue
-
-            direction = direction / norm
-            normal_matrix = identity - np.outer(direction, direction)
-            weight = obs["weight"]
-            a_matrix += weight * normal_matrix
-            b_vector += weight * normal_matrix @ obs["origin"]
-            weight_sum += weight
-
-        if weight_sum <= 1e-6 or np.linalg.cond(a_matrix) > 40.0:
-            return None
-
-        gate_position = np.linalg.solve(a_matrix, b_vector)
-        return [float(gate_position[0]), float(gate_position[1]), float(gate_position[2])]
-
-    def shift_gate_toward_drone(self, sensor_data, gate_position):
-        gate = np.array(gate_position, dtype=float)
-        drone = np.array(
-            [sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"]],
-            dtype=float,
-        )
-        direction = gate[:2] - drone[:2]
-        norm = np.linalg.norm(direction)
-        if norm < 1e-6:
-            return gate_position
-
-        gate[:2] -= self.gate_center_backoff * direction / norm
-        return [float(gate[0]), float(gate[1]), float(gate[2])]
-
-    def maybe_store_gate(self, sensor_data, error, allow_fallback=False):
-        if len(self.learned_gates) >= self.expected_gate_count:
-            self.reset_gate_localization()
-            return False
-
-        self.collect_gate_sample(sensor_data, error)
-        gate_candidate = self.triangulate_gate_position()
-        if gate_candidate is None:
-            if not allow_fallback or len(self.pending_gate_samples) < 6:
-                return False
-            gate_candidate = np.median(np.array(self.pending_gate_samples), axis=0).tolist()
-            print("Triangulation fallback for gate", len(self.learned_gates) + 1)
-
-        gate_candidate = self.shift_gate_toward_drone(sensor_data, gate_candidate)
-
         if self.learned_gates:
-            previous = np.array(self.learned_gates[-1]["gate"])
-            if np.linalg.norm(np.array(gate_candidate) - previous) < 1.0:
-                self.reset_gate_localization()
+            previous = np.array(self.learned_gates[-1].get("post_gate", self.learned_gates[-1]["gate"]))
+            min_gate_spacing = 1.0
+            if np.linalg.norm(np.array(post_gate_candidate) - previous) < min_gate_spacing:
                 return False
 
+        pre_gate_candidate = self.pre_gate_world_estimate(sensor_data, post_gate_candidate)
+        gate_candidate = (
+            0.5 * (np.array(pre_gate_candidate, dtype=float) + np.array(post_gate_candidate, dtype=float))
+        ).tolist()
         self.learned_gates.append(
             {
+                "pre_gate": pre_gate_candidate,
                 "gate": gate_candidate,
+                "post_gate": post_gate_candidate,
             }
         )
-        print("Triangulated gate", len(self.learned_gates), "at", np.round(gate_candidate, 2).tolist())
-        self.reset_gate_localization()
+        self.reset_gate_peak()
         return True
+
+    def maybe_store_peak_gate(self, sensor_data, error):
+        if len(self.pending_gate_samples) < self.min_gate_samples_to_store:
+            return False
+        if self.peak_gate_sample is None:
+            return False
+        if self.peak_gate_area < 0.02:
+            return False
+        if error["area_rel"] > self.peak_gate_area - self.peak_area_drop_to_store:
+            return False
+
+        peak_sensor = self.peak_gate_sensor if self.peak_gate_sensor is not None else sensor_data
+        stored = self.store_gate_candidate(peak_sensor, self.peak_gate_sample)
+        if stored:
+            self.pending_gate_samples = []
+        return stored
+
+    def maybe_store_gate(self, sensor_data, error, collect_current=True, require_min_samples=False):
+        if len(self.learned_gates) >= self.expected_gate_count:
+            self.pending_gate_samples = []
+            self.reset_gate_peak()
+            return
+
+        if collect_current:
+            self.collect_gate_sample(sensor_data, error)
+        if require_min_samples and len(self.pending_gate_samples) < self.min_gate_samples_to_store:
+            return
+        if not self.pending_gate_samples:
+            return
+
+        raw_post_gate_candidate = np.mean(np.array(self.pending_gate_samples), axis=0).tolist()
+        self.pending_gate_samples = []
+        self.store_gate_candidate(sensor_data, raw_post_gate_candidate)
 
     def catmull_rom_point(self, p0, p1, p2, p3, t):
         t2 = t * t
@@ -320,41 +275,19 @@ class MyAssignment:
     def build_replay_trajectory(self):
         if len(self.learned_gates) < self.expected_gate_count:
             self.replay_trajectory = []
-            self.replay_trajectory_types = []
             self.replay_traj_index = 0
             return
 
         control_points = []
-        control_point_types = []
-        gate_points = [np.array(gate_bundle["gate"], dtype=float) for gate_bundle in self.learned_gates]
-        for index, gate_point in enumerate(gate_points):
-            previous_gate = gate_points[(index - 1) % len(gate_points)]
-            approach_direction = gate_point[:2] - previous_gate[:2]
-            norm = np.linalg.norm(approach_direction)
-            if norm < 1e-6:
-                approach_point = gate_point.copy()
-                exit_point = gate_point.copy()
-            else:
-                approach_distance = (
-                    self.first_gate_approach_distance if index == 0 else self.replay_approach_distance
-                )
-                approach_point = gate_point.copy()
-                approach_point[:2] -= approach_distance * approach_direction / norm
-                exit_point = gate_point.copy()
-                exit_point[:2] += self.first_gate_exit_distance * approach_direction / norm
-
-            control_points.append(approach_point)
-            control_point_types.append("approach")
-            control_points.append(gate_point)
-            control_point_types.append("gate")
-            if index == 0:
-                control_points.append(exit_point)
-                control_point_types.append("gate")
+        for gate_bundle in self.learned_gates:
+            control_points.append(np.array(gate_bundle["pre_gate"], dtype=float))
+            control_points.append(np.array(gate_bundle["gate"], dtype=float))
+            if "post_gate" in gate_bundle:
+                control_points.append(np.array(gate_bundle["post_gate"], dtype=float))
 
         point_count = len(control_points)
         trajectory = []
-        trajectory_types = []
-        samples_per_segment = 30
+        samples_per_segment = 20
 
         for index in range(point_count):
             p0 = control_points[(index - 1) % point_count]
@@ -366,31 +299,24 @@ class MyAssignment:
                 t = sample_index / float(samples_per_segment)
                 point = self.catmull_rom_point(p0, p1, p2, p3, t)
                 trajectory.append(point.tolist())
-                trajectory_types.append(control_point_types[index % point_count])
 
         self.replay_trajectory = trajectory
-        self.replay_trajectory_types = trajectory_types
         self.replay_traj_index = 0
-        self.last_printed_replay_type = None
 
-    def replay_current_tolerance(self):
-        if not self.replay_trajectory_types:
-            return self.replay_traj_tol
-        target_type = self.replay_trajectory_types[self.replay_traj_index]
-        if target_type == "approach":
-            return self.replay_traj_tol
-        if target_type == "gate":
-            return self.replay_gate_tol
-        return self.replay_traj_tol
+    def build_recorded_positions(self):
+        if len(self.learned_gates) < self.expected_gate_count:
+            self.recorded_positions = []
+            self.recorded_index = 0
+            return
 
-    def print_replay_target_reached(self):
-        if not self.replay_trajectory_types:
-            return
-        target_type = self.replay_trajectory_types[self.replay_traj_index]
-        if target_type == self.last_printed_replay_type:
-            return
-        print("Reached", target_type)
-        self.last_printed_replay_type = target_type
+        self.recorded_positions = []
+        for gate_bundle in self.learned_gates:
+            self.recorded_positions.append(list(gate_bundle["pre_gate"]))
+            self.recorded_positions.append(list(gate_bundle["gate"]))
+            self.recorded_positions.append(list(gate_bundle["post_gate"]))
+        self.recorded_index = 0
+        self.recorded_cycle = 0
+        self.recorded_wait_timer = 0.0
 
     def search_command(self, sensor_data, dt):
         if self.scan_center_yaw is None:
@@ -509,18 +435,15 @@ class MyAssignment:
         centered = horizontally_centered and vertically_ready
         very_centered = abs(error["dx"]) < 0.06 and abs(z_error) < 0.08
 
-        if error["area_rel"] > 0.012 and abs(error["dx"]) < 0.2 and abs(z_error) < 0.2:
+        sample_ready = error["area_rel"] > 0.015 and abs(error["dx"]) < 0.2 and abs(z_error) < 0.22
+        if sample_ready:
             self.collect_gate_sample(sensor_data, error)
 
-        enough_bearings = len(self.gate_bearing_observations) >= self.min_triangulation_observations
-        if error["area_rel"] > 0.08 and very_centered and enough_bearings:
-            if not self.maybe_store_gate(sensor_data, error, allow_fallback=True):
-                return [
-                    sensor_data["x_global"] + 0.04 * np.cos(sensor_data["yaw"]),
-                    sensor_data["y_global"] + 0.04 * np.sin(sensor_data["yaw"]),
-                    z_target,
-                    yaw_target,
-                ]
+        if sample_ready:
+            self.maybe_store_peak_gate(sensor_data, error)
+
+        if error["area_rel"] > 0.08 and very_centered:
+            self.maybe_store_gate(sensor_data, error, collect_current=not sample_ready)
             self.state = "PASS_THROUGH"
             self.pass_through_timer = 1.0
             self.pass_through_heading = sensor_data["yaw"]
@@ -558,7 +481,11 @@ class MyAssignment:
             self.state = "ADVANCE"
             self.advance_timer = 0.8
             self.scan_center_yaw = self.pass_through_heading
-            self.reset_gate_localization()
+            self.locked_center = None
+            self.locked_area = None
+            self.locked_frames = 0
+            self.pending_gate_samples = []
+            self.reset_gate_peak()
             self.reset_search_pattern(self.pass_through_heading)
 
         return [
@@ -580,8 +507,8 @@ class MyAssignment:
             self.height_aligned = False
             self.reset_search_pattern(sensor_data["yaw"])
             if len(self.learned_gates) >= self.expected_gate_count:
-                self.build_replay_trajectory()
-                self.state = "REPLAY"
+                self.build_recorded_positions()
+                self.state = "RECORDED_VISIT"
 
         return [
             x_target,
@@ -604,8 +531,7 @@ class MyAssignment:
         )
         distance = np.linalg.norm(delta)
 
-        if distance < self.replay_current_tolerance():
-            self.print_replay_target_reached()
+        if distance < self.replay_traj_tol:
             self.replay_traj_index += 1
             if self.replay_traj_index >= len(self.replay_trajectory):
                 self.replay_traj_index = 0
@@ -627,6 +553,57 @@ class MyAssignment:
             sensor_data["x_global"] + self.replay_speed_scale * delta[0],
             sensor_data["y_global"] + self.replay_speed_scale * delta[1],
             sensor_data["z_global"] + self.replay_speed_scale * delta[2],
+            yaw_target,
+        ]
+
+    def recorded_visit_command(self, sensor_data, dt):
+        if not self.recorded_positions:
+            self.state = "SEARCH"
+            return self.search_command(sensor_data, 0.0)
+
+        target = np.array(self.recorded_positions[self.recorded_index], dtype=float)
+        current = np.array(
+            [sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"]],
+            dtype=float,
+        )
+        delta = target - current
+        distance = np.linalg.norm(delta)
+
+        if distance < self.recorded_position_tol:
+            if self.recorded_wait_timer <= 0.0:
+                self.recorded_wait_timer = self.recorded_wait_seconds
+                print("Reached recorded position", self.recorded_index)
+
+            self.recorded_wait_timer -= dt
+            if self.recorded_wait_timer <= 0.0:
+                self.recorded_index += 1
+                self.recorded_wait_timer = 0.0
+                if self.recorded_index >= len(self.recorded_positions):
+                    self.recorded_index = 0
+                    self.recorded_cycle += 1
+                    if self.recorded_cycle >= self.total_recorded_cycles:
+                        self.state = "RETURN_HOME"
+                        return self.return_home_command(sensor_data)
+
+                target = np.array(self.recorded_positions[self.recorded_index], dtype=float)
+                delta = target - current
+            else:
+                return [
+                    float(target[0]),
+                    float(target[1]),
+                    float(target[2]),
+                    sensor_data["yaw"],
+                ]
+
+        if abs(delta[0]) + abs(delta[1]) > 1e-6:
+            yaw_target = np.arctan2(delta[1], delta[0])
+        else:
+            yaw_target = sensor_data["yaw"]
+
+        return [
+            sensor_data["x_global"] + self.recorded_speed_scale * delta[0],
+            sensor_data["y_global"] + self.recorded_speed_scale * delta[1],
+            sensor_data["z_global"] + self.recorded_speed_scale * delta[2],
             yaw_target,
         ]
 
@@ -679,6 +656,9 @@ class MyAssignment:
 
         if self.state == "REPLAY":
             return self.replay_command(sensor_data)
+
+        if self.state == "RECORDED_VISIT":
+            return self.recorded_visit_command(sensor_data, dt)
 
         if self.state == "RETURN_HOME":
             return self.return_home_command(sensor_data)
@@ -739,6 +719,9 @@ class MyAssignment:
 
         self.state = "SEARCH"
         self.height_aligned = False
+        self.locked_center = None
+        self.locked_area = None
+        self.locked_frames = 0
         return self.search_command(sensor_data, dt)
 
 
