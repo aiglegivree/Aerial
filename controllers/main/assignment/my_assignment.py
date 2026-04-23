@@ -24,6 +24,10 @@ class MyAssignment:
         self.last_seen_yaw = None
         self.last_seen_time = 0.0
         self.time_since_start = 0.0
+        self.target_switch_count = 0
+        self.target_switch_limit = 15
+        self.force_rightmost_target = False
+        self.last_target_center_px = None
 
         self.pass_through_timer = 0.0
         self.pass_through_heading = 0.0
@@ -48,6 +52,23 @@ class MyAssignment:
         self.max_triangulation_observations = 40
         self.min_triangulation_baseline = 0.6
         self.gate_center_backoff = 0.35
+        self.side_sample_distance = 0.75
+        self.side_sample_speed = 1
+        self.side_sample_setpoint_distance = 0.25
+        self.side_sample_duration = 30.0
+        self.side_sample_target = None
+        self.side_sample_right_target = None
+        self.side_sample_left_target = None
+        self.side_sample_altitude = self.cruise_altitude
+        self.side_sample_timer = 0.0
+        self.side_sample_used = False
+        self.side_sample_phase = None
+        self.side_sample_best_area = 0.0
+        self.side_sample_best_position = None
+        self.side_sample_last_center_px = None
+        self.side_sample_near_zero_frames = 0
+        self.side_sample_required_zero_frames = 5
+        self.side_sample_zero_area_px = 50.0
         self.replay_approach_distance = 0.7
         self.first_gate_approach_distance = 1.1
         self.first_gate_exit_distance = 0.45
@@ -58,11 +79,12 @@ class MyAssignment:
         self.total_replay_laps = 2
         self.replay_trajectory = []
         self.replay_trajectory_types = []
+        self.replay_trajectory_headings = []
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
         self.replay_traj_tol = 0.55
         self.replay_gate_tol = 0.4
-        self.replay_speed_scale = 1.0
+        self.replay_lookahead_distance = 0.65
 
     def reset_search_pattern(self, current_yaw=None):
         self.scan_phase = 0.0
@@ -90,15 +112,14 @@ class MyAssignment:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
 
-    def rectangle_candidates(self, mask, img_shape, min_area=50):
+    def rectangle_candidates(self, mask, img_shape):
         height, width = img_shape[:2]
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_contours = [c for c in contours if cv2.contourArea(c) > min_area]
-        if not valid_contours:
+        if not contours:
             return []
 
         candidates = []
-        for contour in valid_contours:
+        for contour in contours:
             rect = cv2.minAreaRect(contour)
             box = cv2.boxPoints(rect).astype(np.float32)
 
@@ -106,13 +127,15 @@ class MyAssignment:
             center_y = float(box[:, 1].mean())
             dx = (center_x - width / 2.0) / (width / 2.0)
             dy = (center_y - height / 2.0) / (height / 2.0)
-            area_rel = cv2.contourArea(contour) / float(height * width)
+            area_px = cv2.contourArea(contour)
+            area_rel = area_px / float(height * width)
             pixel_height = float(np.max(box[:, 1]) - np.min(box[:, 1]))
 
             candidates.append(
                 {
                     "dx": float(dx),
                     "dy": float(dy),
+                    "area_px": float(area_px),
                     "area_rel": float(area_rel),
                     "pixel_height": pixel_height,
                     "center_px": (center_x, center_y),
@@ -122,17 +145,50 @@ class MyAssignment:
 
         return sorted(candidates, key=lambda item: item["area_rel"], reverse=True)
 
-    def choose_gate_candidate(self, candidates, sensor_data):
+    def reset_target_switch_tracking(self):
+        self.target_switch_count = 0
+        self.force_rightmost_target = False
+        self.last_target_center_px = None
+
+    def update_target_switch_tracking(self, chosen):
+        if len(self.learned_gates) >= self.expected_gate_count or chosen is None:
+            return
+        if self.force_rightmost_target:
+            self.last_target_center_px = chosen["center_px"]
+            return
+
+        current_center = np.array(chosen["center_px"], dtype=float)
+        if self.last_target_center_px is not None:
+            previous_center = np.array(self.last_target_center_px, dtype=float)
+            height, width = chosen["image_shape"]
+            switch_threshold = 0.22 * np.linalg.norm([width, height])
+            if np.linalg.norm(current_center - previous_center) > switch_threshold:
+                self.target_switch_count += 1
+                if self.target_switch_count > self.target_switch_limit:
+                    self.force_rightmost_target = True
+                    print("Too many target switches, focusing rightmost gate")
+
+        self.last_target_center_px = chosen["center_px"]
+
+    def choose_gate_candidate(self, candidates, track_switches=True):
         if not candidates:
             return None
-        del sensor_data
         rightmost = max(candidates, key=lambda item: item["center_px"][0])
+        if self.force_rightmost_target:
+            if track_switches:
+                self.update_target_switch_tracking(rightmost)
+            return rightmost
         largest = max(candidates, key=lambda item: item["area_rel"])
         if largest["area_rel"] >= 1.3 * rightmost["area_rel"]:
             chosen = largest
         else:
             chosen = rightmost
 
+        if track_switches:
+            self.update_target_switch_tracking(chosen)
+            if self.force_rightmost_target:
+                self.last_target_center_px = rightmost["center_px"]
+                return rightmost
         return chosen
 
     def gate_world_estimate(self, sensor_data, error):
@@ -229,14 +285,29 @@ class MyAssignment:
     def reset_gate_localization(self):
         self.pending_gate_samples = []
         self.gate_bearing_observations = []
+        self.side_sample_target = None
+        self.side_sample_right_target = None
+        self.side_sample_left_target = None
+        self.side_sample_timer = 0.0
+        self.side_sample_used = False
+        self.side_sample_phase = None
+        self.side_sample_best_area = 0.0
+        self.side_sample_best_position = None
+        self.side_sample_last_center_px = None
+        self.side_sample_near_zero_frames = 0
+
+    def triangulation_baseline(self):
+        if len(self.gate_bearing_observations) < 2:
+            return 0.0
+        origins = np.array([obs["origin"] for obs in self.gate_bearing_observations], dtype=float)
+        separations = origins[:, None, :] - origins[None, :, :]
+        return float(np.max(np.linalg.norm(separations, axis=2)))
 
     def triangulate_gate_position(self):
         if len(self.gate_bearing_observations) < self.min_triangulation_observations:
             return None
 
-        origins = np.array([obs["origin"] for obs in self.gate_bearing_observations], dtype=float)
-        baseline = np.max(np.linalg.norm(origins - np.mean(origins, axis=0), axis=1))
-        if baseline < self.min_triangulation_baseline:
+        if self.triangulation_baseline() < self.min_triangulation_baseline:
             return None
 
         a_matrix = np.zeros((3, 3), dtype=float)
@@ -288,7 +359,7 @@ class MyAssignment:
             if not allow_fallback or len(self.pending_gate_samples) < 6:
                 return False
             gate_candidate = np.median(np.array(self.pending_gate_samples), axis=0).tolist()
-            print("Triangulation fallback for gate", len(self.learned_gates) + 1)
+            print("Triangulation fallback for gate", len(self.learned_gates))
 
         gate_candidate = self.shift_gate_toward_drone(sensor_data, gate_candidate)
 
@@ -301,75 +372,207 @@ class MyAssignment:
         self.learned_gates.append(
             {
                 "gate": gate_candidate,
+                "heading": float(sensor_data["yaw"]),
             }
         )
         print("Triangulated gate", len(self.learned_gates), "at", np.round(gate_candidate, 2).tolist())
         self.reset_gate_localization()
         return True
 
-    def catmull_rom_point(self, p0, p1, p2, p3, t):
-        t2 = t * t
-        t3 = t2 * t
-        return 0.5 * (
-            (2.0 * p1)
-            + (-p0 + p2) * t
-            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    def begin_side_sample(self, sensor_data, altitude, initial_error=None):
+        left_direction = np.array([-np.sin(sensor_data["yaw"]), np.cos(sensor_data["yaw"])], dtype=float)
+        right_direction = -left_direction
+        current_xy = np.array([sensor_data["x_global"], sensor_data["y_global"]], dtype=float)
+        right_target = current_xy + self.side_sample_distance * right_direction
+        left_target = current_xy + self.side_sample_distance * left_direction
+
+        self.side_sample_target = right_target
+        self.side_sample_right_target = right_target
+        self.side_sample_left_target = left_target
+        self.side_sample_altitude = altitude
+        self.side_sample_timer = self.side_sample_duration
+        self.side_sample_used = True
+        self.side_sample_phase = "RIGHT_SCAN"
+        self.side_sample_best_area = initial_error["area_rel"] if initial_error is not None else 0.0
+        self.side_sample_best_position = current_xy.copy()
+        self.side_sample_last_center_px = initial_error["center_px"] if initial_error is not None else None
+        self.side_sample_near_zero_frames = 0
+        self.state = "SIDE_SAMPLE"
+        print("Side sample sweeping right")
+        return [
+            sensor_data["x_global"],
+            sensor_data["y_global"],
+            altitude,
+            sensor_data["yaw"],
+        ]
+
+    def choose_side_sample_candidate(self, candidates):
+        if not candidates:
+            return None
+        if self.side_sample_last_center_px is None:
+            return self.choose_gate_candidate(candidates, track_switches=False)
+
+        previous = np.array(self.side_sample_last_center_px, dtype=float)
+        closest = min(
+            candidates,
+            key=lambda item: np.linalg.norm(np.array(item["center_px"], dtype=float) - previous),
         )
+        height, width = closest["image_shape"]
+        max_jump = 0.30 * np.linalg.norm([width, height])
+        jump = np.linalg.norm(np.array(closest["center_px"], dtype=float) - previous)
+        if jump > max_jump and closest["area_rel"] < self.side_sample_best_area * 0.25:
+            return None
+        return closest
+
+    def switch_side_sample_to_left(self):
+        if self.side_sample_left_target is None or self.side_sample_phase != "RIGHT_SCAN":
+            return
+
+        self.side_sample_target = self.side_sample_left_target.copy()
+        self.side_sample_phase = "LEFT_SCAN"
+        self.side_sample_near_zero_frames = 0
+        print("Side sample sweeping left")
+
+    def switch_side_sample_to_best(self):
+        if self.side_sample_best_position is None:
+            return
+
+        self.side_sample_target = self.side_sample_best_position.copy()
+        self.side_sample_phase = "RETURN_BEST"
+        self.side_sample_near_zero_frames = 0
+        print("Side sample returning to max area")
+
+    def side_sample_command(self, sensor_data, camera_data, dt):
+        self.side_sample_timer -= dt
+        if self.side_sample_target is None:
+            self.state = "TRACK"
+            return [
+                sensor_data["x_global"],
+                sensor_data["y_global"],
+                sensor_data["z_global"],
+                sensor_data["yaw"],
+            ]
+
+        mask = self.compute_mask(camera_data)
+        candidates = self.rectangle_candidates(mask, camera_data.shape)
+        error = self.choose_side_sample_candidate(candidates)
+        usable_error = None
+        yaw_target = sensor_data["yaw"]
+        current_xy = np.array([sensor_data["x_global"], sensor_data["y_global"]], dtype=float)
+
+        if error is not None:
+            self.last_seen_yaw = sensor_data["yaw"]
+            self.last_seen_time = self.time_since_start
+            self.scan_center_yaw = sensor_data["yaw"]
+            yaw_correction = -0.7 * error["dx"]
+            yaw_target = sensor_data["yaw"] + np.clip(yaw_correction, -np.deg2rad(14), np.deg2rad(14))
+
+            current_area = error["area_rel"]
+            area_near_zero = error["area_px"] < self.side_sample_zero_area_px
+            if area_near_zero:
+                self.side_sample_near_zero_frames += 1
+                if self.side_sample_near_zero_frames >= self.side_sample_required_zero_frames:
+                    if self.side_sample_phase == "RIGHT_SCAN":
+                        self.switch_side_sample_to_left()
+                    elif self.side_sample_phase == "LEFT_SCAN":
+                        self.switch_side_sample_to_best()
+            else:
+                self.side_sample_near_zero_frames = 0
+                self.side_sample_last_center_px = error["center_px"]
+                self.collect_gate_sample(sensor_data, error)
+                usable_error = error
+
+            if not area_near_zero and current_area > self.side_sample_best_area:
+                self.side_sample_best_area = current_area
+                self.side_sample_best_position = current_xy.copy()
+        else:
+            self.side_sample_near_zero_frames += 1
+            if self.side_sample_near_zero_frames >= self.side_sample_required_zero_frames:
+                if self.side_sample_phase == "RIGHT_SCAN":
+                    self.switch_side_sample_to_left()
+                elif self.side_sample_phase == "LEFT_SCAN":
+                    self.switch_side_sample_to_best()
+
+        reached_target = np.linalg.norm(self.side_sample_target - current_xy) < 0.18
+        if reached_target and self.side_sample_phase == "RIGHT_SCAN":
+            self.switch_side_sample_to_left()
+            reached_target = False
+        elif reached_target and self.side_sample_phase == "LEFT_SCAN":
+            self.switch_side_sample_to_best()
+            reached_target = False
+
+        if self.side_sample_timer <= 0.0 and self.side_sample_phase != "RETURN_BEST":
+            self.switch_side_sample_to_best()
+            reached_target = False
+
+        if (reached_target and self.side_sample_phase == "RETURN_BEST") or self.side_sample_timer <= 0.0:
+            self.side_sample_target = None
+            self.side_sample_timer = 0.0
+            self.side_sample_phase = None
+            self.state = "TRACK"
+            if usable_error is not None:
+                return self.align_and_approach_command(sensor_data, usable_error)
+            return [
+                sensor_data["x_global"],
+                sensor_data["y_global"],
+                self.side_sample_altitude,
+                yaw_target,
+            ]
+
+        delta = self.side_sample_target - current_xy
+        distance = np.linalg.norm(delta)
+        if distance > 1e-6:
+            max_step = self.side_sample_setpoint_distance
+            command_xy = current_xy + min(distance, max_step) * delta / distance
+        else:
+            command_xy = current_xy
+
+        return [
+            float(command_xy[0]),
+            float(command_xy[1]),
+            self.side_sample_altitude,
+            yaw_target,
+        ]
 
     def build_replay_trajectory(self):
         if len(self.learned_gates) < self.expected_gate_count:
             self.replay_trajectory = []
             self.replay_trajectory_types = []
+            self.replay_trajectory_headings = []
             self.replay_traj_index = 0
             return
 
-        control_points = []
-        control_point_types = []
-        gate_points = [np.array(gate_bundle["gate"], dtype=float) for gate_bundle in self.learned_gates]
-        for index, gate_point in enumerate(gate_points):
-            previous_gate = gate_points[(index - 1) % len(gate_points)]
-            approach_direction = gate_point[:2] - previous_gate[:2]
-            norm = np.linalg.norm(approach_direction)
-            if norm < 1e-6:
-                approach_point = gate_point.copy()
-                exit_point = gate_point.copy()
-            else:
-                approach_distance = (
-                    self.first_gate_approach_distance if index == 0 else self.replay_approach_distance
-                )
-                approach_point = gate_point.copy()
-                approach_point[:2] -= approach_distance * approach_direction / norm
-                exit_point = gate_point.copy()
-                exit_point[:2] += self.first_gate_exit_distance * approach_direction / norm
-
-            control_points.append(approach_point)
-            control_point_types.append("approach")
-            control_points.append(gate_point)
-            control_point_types.append("gate")
-            if index == 0:
-                control_points.append(exit_point)
-                control_point_types.append("gate")
-
-        point_count = len(control_points)
         trajectory = []
         trajectory_types = []
-        samples_per_segment = 30
+        trajectory_headings = []
+        for index, gate_bundle in enumerate(self.learned_gates):
+            gate_point = np.array(gate_bundle["gate"], dtype=float)
+            heading = gate_bundle.get("heading")
+            if heading is None:
+                previous_gate = np.array(self.learned_gates[(index - 1) % len(self.learned_gates)]["gate"], dtype=float)
+                approach_direction = gate_point[:2] - previous_gate[:2]
+                heading = np.arctan2(approach_direction[1], approach_direction[0])
 
-        for index in range(point_count):
-            p0 = control_points[(index - 1) % point_count]
-            p1 = control_points[index % point_count]
-            p2 = control_points[(index + 1) % point_count]
-            p3 = control_points[(index + 2) % point_count]
+            approach_direction = np.array([np.cos(heading), np.sin(heading)], dtype=float)
+            approach_distance = self.first_gate_approach_distance if index == 0 else self.replay_approach_distance
+            approach_point = gate_point.copy()
+            approach_point[:2] -= approach_distance * approach_direction
+            exit_point = gate_point.copy()
+            exit_point[:2] += self.first_gate_exit_distance * approach_direction
 
-            for sample_index in range(samples_per_segment):
-                t = sample_index / float(samples_per_segment)
-                point = self.catmull_rom_point(p0, p1, p2, p3, t)
-                trajectory.append(point.tolist())
-                trajectory_types.append(control_point_types[index % point_count])
+            trajectory.append(approach_point.tolist())
+            trajectory_types.append("approach")
+            trajectory_headings.append(heading)
+            trajectory.append(gate_point.tolist())
+            trajectory_types.append("gate")
+            trajectory_headings.append(heading)
+            trajectory.append(exit_point.tolist())
+            trajectory_types.append("exit")
+            trajectory_headings.append(heading)
 
         self.replay_trajectory = trajectory
         self.replay_trajectory_types = trajectory_types
+        self.replay_trajectory_headings = trajectory_headings
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
 
@@ -514,6 +717,9 @@ class MyAssignment:
 
         enough_bearings = len(self.gate_bearing_observations) >= self.min_triangulation_observations
         if error["area_rel"] > 0.08 and very_centered and enough_bearings:
+            baseline_ready = self.triangulation_baseline() >= self.min_triangulation_baseline
+            if not baseline_ready and not self.side_sample_used:
+                return self.begin_side_sample(sensor_data, z_target, error)
             if not self.maybe_store_gate(sensor_data, error, allow_fallback=True):
                 return [
                     sensor_data["x_global"] + 0.04 * np.cos(sensor_data["yaw"]),
@@ -559,6 +765,7 @@ class MyAssignment:
             self.advance_timer = 0.8
             self.scan_center_yaw = self.pass_through_heading
             self.reset_gate_localization()
+            self.reset_target_switch_tracking()
             self.reset_search_pattern(self.pass_through_heading)
 
         return [
@@ -595,8 +802,6 @@ class MyAssignment:
             self.state = "SEARCH"
             return self.search_command(sensor_data, 0.0)
         target = np.array(self.replay_trajectory[self.replay_traj_index], dtype=float)
-        next_index = (self.replay_traj_index + 1) % len(self.replay_trajectory)
-        next_target = np.array(self.replay_trajectory[next_index], dtype=float)
 
         delta = target - np.array(
             [sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"]],
@@ -615,18 +820,35 @@ class MyAssignment:
                     return self.return_home_command(sensor_data)
 
             target = np.array(self.replay_trajectory[self.replay_traj_index], dtype=float)
-            next_index = (self.replay_traj_index + 1) % len(self.replay_trajectory)
-            next_target = np.array(self.replay_trajectory[next_index], dtype=float)
             delta = target - np.array(
                 [sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"]],
                 dtype=float,
             )
+            distance = np.linalg.norm(delta)
 
-        yaw_target = np.arctan2(next_target[1] - target[1], next_target[0] - target[0])
+        if len(self.replay_trajectory_headings) == len(self.replay_trajectory):
+            yaw_target = self.replay_trajectory_headings[self.replay_traj_index]
+        else:
+            yaw_target = sensor_data["yaw"]
+
+        command_target = target
+        is_final_replay_target = (
+            self.replay_lap == self.total_replay_laps - 1
+            and self.replay_traj_index == len(self.replay_trajectory) - 1
+        )
+        if not is_final_replay_target and len(self.replay_trajectory) > 1 and distance < self.replay_lookahead_distance:
+            next_index = (self.replay_traj_index + 1) % len(self.replay_trajectory)
+            next_target = np.array(self.replay_trajectory[next_index], dtype=float)
+            segment = next_target - target
+            segment_norm = np.linalg.norm(segment)
+            if segment_norm > 1e-6:
+                lookahead_ratio = 1.0 - distance / self.replay_lookahead_distance
+                command_target = target + np.clip(lookahead_ratio, 0.0, 1.0) * segment
+
         return [
-            sensor_data["x_global"] + self.replay_speed_scale * delta[0],
-            sensor_data["y_global"] + self.replay_speed_scale * delta[1],
-            sensor_data["z_global"] + self.replay_speed_scale * delta[2],
+            float(command_target[0]),
+            float(command_target[1]),
+            float(command_target[2]),
             yaw_target,
         ]
 
@@ -637,7 +859,7 @@ class MyAssignment:
 
         if np.linalg.norm([dx, dy, dz]) < 0.25:
             self.state = "WAIT"
-            return self.wait_command(sensor_data)
+            return self.wait_command()
 
         yaw_target = np.arctan2(dy, dx) if abs(dx) + abs(dy) > 1e-6 else self.home_setpoint[3]
         return [
@@ -647,7 +869,7 @@ class MyAssignment:
             yaw_target,
         ]
 
-    def wait_command(self, sensor_data):
+    def wait_command(self):
         return [
             self.home_setpoint[0],
             self.home_setpoint[1],
@@ -677,6 +899,9 @@ class MyAssignment:
         if self.state == "ADVANCE":
             return self.advance_command(sensor_data, dt)
 
+        if self.state == "SIDE_SAMPLE":
+            return self.side_sample_command(sensor_data, camera_data, dt)
+
         if self.state == "REPLAY":
             return self.replay_command(sensor_data)
 
@@ -684,7 +909,7 @@ class MyAssignment:
             return self.return_home_command(sensor_data)
 
         if self.state == "WAIT":
-            return self.wait_command(sensor_data)
+            return self.wait_command()
 
         if self.state == "GO_TO_ORBIT":
             return self.go_to_orbit_command(sensor_data)
@@ -692,7 +917,7 @@ class MyAssignment:
         if self.state == "SEARCH_ORBIT":
             mask = self.compute_mask(camera_data)
             candidates = self.rectangle_candidates(mask, camera_data.shape)
-            error = self.choose_gate_candidate(candidates, sensor_data)
+            error = self.choose_gate_candidate(candidates)
             if error is not None:
                 self.last_seen_yaw = sensor_data["yaw"]
                 self.last_seen_time = self.time_since_start
@@ -705,7 +930,7 @@ class MyAssignment:
         if self.state == "ROTATE_LEFT":
             mask = self.compute_mask(camera_data)
             candidates = self.rectangle_candidates(mask, camera_data.shape)
-            error = self.choose_gate_candidate(candidates, sensor_data)
+            error = self.choose_gate_candidate(candidates)
             if error is not None:
                 self.last_seen_yaw = sensor_data["yaw"]
                 self.last_seen_time = self.time_since_start
@@ -717,7 +942,7 @@ class MyAssignment:
 
         mask = self.compute_mask(camera_data)
         candidates = self.rectangle_candidates(mask, camera_data.shape)
-        error = self.choose_gate_candidate(candidates, sensor_data)
+        error = self.choose_gate_candidate(candidates)
 
         if error is not None:
             self.last_seen_yaw = sensor_data["yaw"]
