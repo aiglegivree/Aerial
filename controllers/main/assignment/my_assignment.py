@@ -493,7 +493,7 @@ class MyAssignment:
                 elif self.side_sample_phase == "LEFT_SCAN":
                     self.switch_side_sample_to_best()
 
-        reached_target = np.linalg.norm(self.side_sample_target - current_xy) < 0.18
+        reached_target = np.linalg.norm(self.side_sample_target - current_xy) < 0.05
         if reached_target and self.side_sample_phase == "RIGHT_SCAN":
             self.switch_side_sample_to_left()
             reached_target = False
