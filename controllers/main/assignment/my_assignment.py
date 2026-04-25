@@ -14,7 +14,6 @@ class MyAssignment:
         self.first_lap_cone_angle_offset = np.deg2rad(2.0)
         self.first_lap_cone_tol = 0.35
         self.first_lap_cone_step = 0.35
-        self.first_lap_cone_yaw_step = np.deg2rad(10.0)
         self.first_lap_cone_target = None
         self.scan_phase = 0.0
         self.scan_center_yaw = None
@@ -107,11 +106,13 @@ class MyAssignment:
         self.replay_trajectory_headings = []
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
-        self.replay_traj_tol = 0.3
+        self.replay_traj_tol = 0.45
         self.replay_gate_tol = 0.2
         self.replay_lookahead_distance = 0.65
         self.replay_switch_distance = 1.2
         self.replay_segment_lookahead = 1.2
+        self.replay_xy_step = 0.45
+        self.replay_z_step = 0.12
         self.search_sweep_translation = 0.00001
 
     def reset_search_pattern(self, current_yaw=None):
@@ -645,6 +646,7 @@ class MyAssignment:
         self.side_sample_target = self.side_sample_left_target.copy()
         self.side_sample_phase = "LEFT_SCAN"
         self.side_sample_phase_best_area = 0.0
+        self.side_sample_last_center_px = None
         self.side_sample_near_zero_frames = 0
         print("Side sample sweeping left")
 
@@ -655,6 +657,7 @@ class MyAssignment:
         self.side_sample_target = self.side_sample_right_target.copy()
         self.side_sample_phase = "RIGHT_SCAN"
         self.side_sample_phase_best_area = 0.0
+        self.side_sample_last_center_px = None
         self.side_sample_near_zero_frames = 0
         print("Side sample sweeping right")
 
@@ -665,6 +668,7 @@ class MyAssignment:
         self.side_sample_target = self.side_sample_best_position.copy()
         self.side_sample_phase = "RETURN_BEST"
         self.side_sample_phase_best_area = 0.0
+        self.side_sample_last_center_px = None
         self.side_sample_near_zero_frames = 0
         print("Side sample returning to max area")
 
@@ -694,15 +698,11 @@ class MyAssignment:
             yaw_target = sensor_data["yaw"] + np.clip(yaw_correction, -np.deg2rad(14), np.deg2rad(14))
 
             current_area = error["area_rel"]
-            if self.side_sample_phase in ("LEFT_SCAN", "RIGHT_SCAN"):
-                self.side_sample_phase_best_area = max(
-                    self.side_sample_phase_best_area,
-                    current_area,
-                )
-            switch_area_threshold = 0.1 * self.side_sample_phase_best_area
+            phase_best_area = self.side_sample_phase_best_area
+            switch_area_threshold = 0.2 * phase_best_area
             should_switch_side = (
                 self.side_sample_phase in ("LEFT_SCAN", "RIGHT_SCAN")
-                and self.side_sample_phase_best_area > 0.0
+                and phase_best_area > 0.0
                 and current_area < switch_area_threshold
             )
             if should_switch_side:
@@ -728,6 +728,8 @@ class MyAssignment:
             if not should_switch_side and current_area > self.side_sample_best_area:
                 self.side_sample_best_area = current_area
                 self.side_sample_best_position = current_xy.copy()
+            if not should_switch_side and current_area > self.side_sample_phase_best_area:
+                self.side_sample_phase_best_area = current_area
         else:
             self.side_sample_near_zero_frames += 1
             if (
@@ -750,6 +752,7 @@ class MyAssignment:
         if self.side_sample_timer <= 0.0 and self.side_sample_phase != "RETURN_BEST":
             print("Swipe timer expired, returning to best area")
             self.switch_side_sample_to_best()
+            self.side_sample_timer = 1.5
             reached_target = False
 
         if (reached_target and self.side_sample_phase == "RETURN_BEST") or self.side_sample_timer <= 0.0:
@@ -889,6 +892,16 @@ class MyAssignment:
         if target_type == "gate":
             return self.replay_gate_tol
         return self.replay_traj_tol
+
+    def replay_target_distance(self, target, current_position):
+        target_type = (
+            self.replay_trajectory_types[self.replay_traj_index]
+            if self.replay_trajectory_types
+            else None
+        )
+        if target_type in ("approach", "gate", "exit", "entry"):
+            return float(np.linalg.norm(target[:2] - current_position[:2]))
+        return float(np.linalg.norm(target - current_position))
 
     def print_replay_target_reached(self):
         if not self.replay_trajectory_types:
@@ -1155,18 +1168,11 @@ class MyAssignment:
         else:
             command_xy = current_xy
 
-        yaw_error = self.wrap_angle(float(target[3]) - sensor_data["yaw"])
-        yaw_target = sensor_data["yaw"] + np.clip(
-            yaw_error,
-            -self.first_lap_cone_yaw_step,
-            self.first_lap_cone_yaw_step,
-        )
-
         return [
             float(command_xy[0]),
             float(command_xy[1]),
             float(target[2]),
-            float(yaw_target),
+            sensor_data["yaw"],
         ]
 
     def replay_command(self, sensor_data):
@@ -1181,7 +1187,7 @@ class MyAssignment:
         while True:
             target = np.array(self.replay_trajectory[self.replay_traj_index], dtype=float)
             delta = target - current_position
-            distance = np.linalg.norm(delta)
+            distance = self.replay_target_distance(target, current_position)
             target_type = (
                 self.replay_trajectory_types[self.replay_traj_index]
                 if self.replay_trajectory_types
@@ -1205,7 +1211,7 @@ class MyAssignment:
 
         target = np.array(self.replay_trajectory[self.replay_traj_index], dtype=float)
         delta = target - current_position
-        distance = np.linalg.norm(delta)
+        distance = self.replay_target_distance(target, current_position)
 
         yaw_target = sensor_data["yaw"]
 
@@ -1228,10 +1234,23 @@ class MyAssignment:
                 along_segment = min(self.replay_segment_lookahead, segment_norm)
                 command_target = target + lookahead_ratio * along_segment * segment / segment_norm
 
+        command_xy = command_target[:2]
+        command_delta_xy = command_xy - current_position[:2]
+        command_distance_xy = np.linalg.norm(command_delta_xy)
+        if command_distance_xy > self.replay_xy_step:
+            command_xy = current_position[:2] + self.replay_xy_step * command_delta_xy / command_distance_xy
+
+        z_error = float(command_target[2] - current_position[2])
+        command_z = current_position[2] + np.clip(
+            z_error,
+            -self.replay_z_step,
+            self.replay_z_step,
+        )
+
         return [
-            float(command_target[0]),
-            float(command_target[1]),
-            float(command_target[2]),
+            float(command_xy[0]),
+            float(command_xy[1]),
+            float(command_z),
             yaw_target,
         ]
 
