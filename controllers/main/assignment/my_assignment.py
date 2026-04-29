@@ -47,10 +47,10 @@ class MyAssignment:
         self.pass_through_duration = 1.35
         self.pass_through_distance = 0.8
         self.first_lap_gate_target = None
-        self.first_lap_gate_tol_xy = 0.08
-        self.first_lap_gate_tol_z = 0.10
-        self.first_lap_gate_xy_step = 0.45
-        self.first_lap_gate_z_step = 0.16
+        self.first_lap_gate_tol_xy = 0.15
+        self.first_lap_gate_tol_z = 0.2
+        self.first_lap_gate_xy_step = 1.0
+        self.first_lap_gate_z_step = 0.3
         self.advance_timer = 0.0
         self.advance_duration = 1.1
         self.advance_distance = 0.45
