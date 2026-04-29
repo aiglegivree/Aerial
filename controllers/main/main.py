@@ -1,4 +1,6 @@
 # Main simulation file called by the Webots
+import json
+import os
 import sys
 print("You are using python at this location:", sys.executable)
 
@@ -17,6 +19,35 @@ import threading
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'      # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
+assignment_seed = None           # Set to an integer to reproduce a world, or keep None for a random seed
+
+
+def get_assignment_seed():
+    seed = os.environ.get("AERIAL_ASSIGNMENT_SEED")
+    if seed is None or seed == "":
+        seed = assignment_seed
+    if seed is None:
+        return random.SystemRandom().randint(0, 2**32 - 1)
+    try:
+        return int(seed)
+    except ValueError as exc:
+        raise ValueError("AERIAL_ASSIGNMENT_SEED and assignment_seed must be integers") from exc
+
+
+def write_assignment_result(seed, lap_times, gate_progress):
+    result_file = os.environ.get("AERIAL_ASSIGNMENT_RESULT_FILE")
+    if not result_file:
+        return
+
+    success = all(all(lap) for lap in gate_progress)
+    result = {
+        "seed": seed,
+        "success": success,
+        "lap_times": lap_times,
+        "gate_progress": gate_progress,
+    }
+    with open(result_file, "w", encoding="utf-8") as file:
+        json.dump(result, file)
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -172,6 +203,10 @@ class CrazyflieInDroneDome(Supervisor):
         
             # Randomise the positions of the drone and gates
             if rand_env:
+                self.assignment_seed = get_assignment_seed()
+                print("Assignment world seed:", self.assignment_seed, flush=True)
+                random.seed(self.assignment_seed)
+                np.random.seed(self.assignment_seed)
                 self.randomise_positions()
 
             # Get the position, size, and orientation of each of the gates
@@ -334,8 +369,13 @@ class CrazyflieInDroneDome(Supervisor):
         
         # If finished all segments print the lap times
         if drone.lap == drone.num_laps:
-            print("Lap times:", drone.lap_times)
-            print("Gate progress:", drone.gate_progress)
+            print("Lap times:", drone.lap_times, flush=True)
+            print("Gate progress:", drone.gate_progress, flush=True)
+            write_assignment_result(
+                getattr(drone, "assignment_seed", None),
+                drone.lap_times,
+                drone.gate_progress,
+            )
             return False
         
         return True
@@ -739,6 +779,8 @@ if __name__ == '__main__':
                     
                     # If the drone has completed the assignment, crash the drone
                     if not running:    
+                        if os.environ.get("AERIAL_ASSIGNMENT_QUIT_AFTER_RUN", "").lower() in ("1", "true", "yes"):
+                            drone.simulationQuit(0)
                         break
 
                 # Update the PID control time
