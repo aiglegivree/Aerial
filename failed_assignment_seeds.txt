@@ -1,7 +1,5 @@
 148301706 # not all gates passed gate_progress=[[True, True, True, True, True], [False, True, True, True, True], [False, True, True, True, True]]
 ..............
-3035429799 # not all gates passed gate_progress=[[True, True, True, True, True], [True, True, True, True, True], [True, True, False, True, True]]
-2431636090 # not all gates passed gate_progress=[[True, True, True, True, True], [True, False, True, True, False], [True, True, True, True, False]]
-1516081312 # not all gates passed gate_progress=[[True, True, True, True, True], [True, True, True, False, True], [True, True, True, False, True]]
-3608917268 # not all gates passed gate_progress=[[True, True, True, True, True], [True, True, True, True, True], [True, True, True, True, False]]
-2872896872 # not all gates passed gate_progress=[[True, True, True, True, True], [True, False, True, True, True], [True, True, True, True, True]]
+591269432 # not all gates passed gate_progress=[[True, True, True, True, True], [False, True, True, True, True], [False, True, True, True, True]]
+...............
+3316890752 # no gate progress output, exit_code=3221225786
