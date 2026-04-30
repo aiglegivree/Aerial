@@ -125,16 +125,16 @@ class MyAssignment:
         self.replay_trajectory_types = []
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
-        self.replay_traj_tol = 0.6
-        self.replay_gate_tol = 0.3
-        self.replay_gate_z_tol = 0.35
-        self.replay_traj_z_tol = 0.45
+        self.replay_traj_tol = 0.55
+        self.replay_gate_tol = 0.12
+        self.replay_gate_z_tol = 0.2
+        self.replay_traj_z_tol = 0.4
         self.replay_lookahead_distance = 2
         self.replay_switch_distance = 0.2
         self.replay_segment_lookahead = 2
         self.replay_xy_step = 2
         self.replay_z_step = 1
-        self.replay_approach_distance = 0.2
+        self.replay_approach_distance = 0.35
         self.replay_exit_distance = 0.6
 
     def debug_print(self, message, min_interval=0.0):

@@ -67,6 +67,16 @@ def average_columns(rows):
     return averages
 
 
+def parse_seed_list(seed_values):
+    seeds = []
+    for value in seed_values or []:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                seeds.append(int(item))
+    return seeds
+
+
 def run_one_seed(webots, world, seed, timeout, port, result_dir, mode):
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"seed_{seed}_port_{port}.json"
@@ -160,6 +170,7 @@ def main():
     parser.add_argument("--port", type=int, default=1235, help="First Webots port to use. Parallel runs use following ports.")
     parser.add_argument("--parallel", type=int, default=1, help="Number of Webots simulations to run at the same time.")
     parser.add_argument("--mode", default="realtime", choices=["realtime", "fast", "pause"], help="Webots simulation mode.")
+    parser.add_argument("--seeds", nargs="*", help="Specific seed(s) to run, separated by spaces or commas.")
     parser.add_argument("--show-output", action="store_true", help="Print full Webots output after each run.")
     args = parser.parse_args()
 
@@ -171,8 +182,12 @@ def main():
     if not world.exists():
         raise FileNotFoundError(f"World file not found: {world}")
 
-    random_source = random.SystemRandom()
-    seeds = [random_source.randint(0, 2**32 - 1) for _ in range(args.runs)]
+    seeds = parse_seed_list(args.seeds)
+    if seeds:
+        args.runs = len(seeds)
+    else:
+        random_source = random.SystemRandom()
+        seeds = [random_source.randint(0, 2**32 - 1) for _ in range(args.runs)]
     parallel = max(1, args.parallel)
     print(f"Running {args.runs} assignment simulations with {webots}")
     print(f"Webots mode: {args.mode}")
