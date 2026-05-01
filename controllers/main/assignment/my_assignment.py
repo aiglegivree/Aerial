@@ -981,7 +981,7 @@ class MyAssignment:
         for index, gate_bundle in enumerate(self.learned_gates):
             gate_point = np.array(gate_bundle["gate"], dtype=float)
             heading = gate_bundle.get("heading")
-            if heading is None:
+            if index == 0 or heading is None:
                 previous_gate = np.array(
                     self.learned_gates[(index - 1) % len(self.learned_gates)]["gate"],
                     dtype=float,
