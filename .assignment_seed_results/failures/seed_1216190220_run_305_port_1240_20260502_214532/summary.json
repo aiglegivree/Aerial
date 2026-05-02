@@ -1,0 +1,35 @@
+{
+  "seed": 1216190220,
+  "port": 1240,
+  "run_index": 305,
+  "reason": "no gate progress output, exit_code=3221225786",
+  "mode": "fast",
+  "batch": true,
+  "render": false,
+  "timeout": 240,
+  "command": [
+    "C:\\Program Files\\Webots\\msys64\\mingw64\\bin\\webots.exe",
+    "--batch",
+    "--mode=fast",
+    "--stdout",
+    "--stderr",
+    "--port=1240",
+    "--no-rendering",
+    "--minimize",
+    "C:\\Users\\ayoub\\Code\\Aerial\\worlds\\crazyflie_world_assignment.wbt"
+  ],
+  "cwd": "C:\\Users\\ayoub\\Code\\Aerial",
+  "env": {
+    "AERIAL_ASSIGNMENT_SEED": "1216190220",
+    "AERIAL_ASSIGNMENT_QUIT_AFTER_RUN": "1",
+    "AERIAL_ASSIGNMENT_RESULT_FILE": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_1216190220_port_1240.json",
+    "PYTHONPATH": null,
+    "WEBOTS_HOME": "C:\\Program Files\\Webots"
+  },
+  "gate_progress": null,
+  "lap_times": null,
+  "result_file": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_1216190220_port_1240.json",
+  "result_payload": null,
+  "webots_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_1216190220_run_305_port_1240_20260502_214532\\webots.log",
+  "debug_replay_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_1216190220_run_305_port_1240_20260502_214532\\debug_replay.log"
+}

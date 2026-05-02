@@ -1,0 +1,92 @@
+{
+  "seed": 2616896143,
+  "port": 1239,
+  "run_index": 5,
+  "reason": "not all gates passed",
+  "mode": "fast",
+  "batch": true,
+  "render": false,
+  "timeout": 240,
+  "command": [
+    "C:\\Program Files\\Webots\\msys64\\mingw64\\bin\\webots.exe",
+    "--batch",
+    "--mode=fast",
+    "--stdout",
+    "--stderr",
+    "--port=1239",
+    "--no-rendering",
+    "--minimize",
+    "C:\\Users\\ayoub\\Code\\Aerial\\worlds\\crazyflie_world_assignment.wbt"
+  ],
+  "cwd": "C:\\Users\\ayoub\\Code\\Aerial",
+  "env": {
+    "AERIAL_ASSIGNMENT_SEED": "2616896143",
+    "AERIAL_ASSIGNMENT_QUIT_AFTER_RUN": "1",
+    "AERIAL_ASSIGNMENT_RESULT_FILE": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_2616896143_port_1239.json",
+    "PYTHONPATH": null,
+    "WEBOTS_HOME": "C:\\Program Files\\Webots"
+  },
+  "gate_progress": [
+    [
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    [
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    [
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  ],
+  "lap_times": [
+    99.776,
+    14.072000000000003,
+    14.287999999999982
+  ],
+  "result_file": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_2616896143_port_1239.json",
+  "result_payload": {
+    "seed": 2616896143,
+    "success": false,
+    "lap_times": [
+      99.776,
+      14.072000000000003,
+      14.287999999999982
+    ],
+    "gate_progress": [
+      [
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        false,
+        true,
+        true
+      ]
+    ]
+  },
+  "webots_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_2616896143_run_5_port_1239_20260502_195320\\webots.log",
+  "debug_replay_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_2616896143_run_5_port_1239_20260502_195320\\debug_replay.log"
+}

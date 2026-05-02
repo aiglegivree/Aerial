@@ -1,0 +1,92 @@
+{
+  "seed": 1427085299,
+  "port": 1248,
+  "run_index": 14,
+  "reason": "not all gates passed",
+  "mode": "fast",
+  "batch": true,
+  "render": false,
+  "timeout": 240,
+  "command": [
+    "C:\\Program Files\\Webots\\msys64\\mingw64\\bin\\webots.exe",
+    "--batch",
+    "--mode=fast",
+    "--stdout",
+    "--stderr",
+    "--port=1248",
+    "--no-rendering",
+    "--minimize",
+    "C:\\Users\\ayoub\\Code\\Aerial\\worlds\\crazyflie_world_assignment.wbt"
+  ],
+  "cwd": "C:\\Users\\ayoub\\Code\\Aerial",
+  "env": {
+    "AERIAL_ASSIGNMENT_SEED": "1427085299",
+    "AERIAL_ASSIGNMENT_QUIT_AFTER_RUN": "1",
+    "AERIAL_ASSIGNMENT_RESULT_FILE": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_1427085299_port_1248.json",
+    "PYTHONPATH": null,
+    "WEBOTS_HOME": "C:\\Program Files\\Webots"
+  },
+  "gate_progress": [
+    [
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    [
+      true,
+      true,
+      false,
+      true,
+      true
+    ],
+    [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  ],
+  "lap_times": [
+    96.85600000000001,
+    15.424000000000007,
+    13.88800000000002
+  ],
+  "result_file": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\seed_1427085299_port_1248.json",
+  "result_payload": {
+    "seed": 1427085299,
+    "success": false,
+    "lap_times": [
+      96.85600000000001,
+      15.424000000000007,
+      13.88800000000002
+    ],
+    "gate_progress": [
+      [
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        false,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    ]
+  },
+  "webots_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_1427085299_run_14_port_1248_20260502_203229\\webots.log",
+  "debug_replay_log": "C:\\Users\\ayoub\\Code\\Aerial\\.assignment_seed_results\\failures\\seed_1427085299_run_14_port_1248_20260502_203229\\debug_replay.log"
+}

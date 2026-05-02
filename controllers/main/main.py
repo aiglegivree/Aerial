@@ -19,7 +19,7 @@ import threading
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'      # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
-assignment_seed = 2073798997           # Set to an integer to reproduce a world, or keep None for a random seed
+assignment_seed = 3673914812    # Set to an integer to reproduce a world, or keep None for a random seed
 
 
 def get_assignment_seed():

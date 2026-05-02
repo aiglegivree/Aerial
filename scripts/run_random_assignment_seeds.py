@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -16,6 +17,24 @@ DEFAULT_WORLD = PROJECT_ROOT / "worlds" / "crazyflie_world_assignment.wbt"
 DEFAULT_FAILED_FILE = PROJECT_ROOT / "failed_assignment_seeds.txt"
 DEFAULT_RESULT_DIR = PROJECT_ROOT / ".assignment_seed_results"
 GATE_PROGRESS_RE = re.compile(r"Gate progress:\s*(\[\[.*\]\])")
+DEBUG_LINE_MARKERS = (
+    "Assignment world seed:",
+    "Timing started",
+    "Lap completed",
+    "Gate progress:",
+    "Moving to the next segment",
+    "Traceback",
+    "Exception",
+    "[assignment",
+)
+RACING_DEBUG_MARKERS = (
+    "Lap completed",
+    "Gate progress:",
+    "Moving to the next segment",
+    "Traceback",
+    "Exception",
+    "[assignment",
+)
 
 
 def find_webots(explicit_path):
@@ -56,6 +75,95 @@ def append_failed_seed(path, seed, reason, gate_progress):
         failed_file.write(f"{seed} # {reason}{progress_text}\n")
 
 
+def relevant_debug_lines(output, include_detection_lap=False):
+    if not output:
+        return []
+
+    markers = DEBUG_LINE_MARKERS if include_detection_lap else RACING_DEBUG_MARKERS
+    lines = []
+    detection_lap_finished = include_detection_lap
+    for line in output.splitlines():
+        if "Lap completed" in line:
+            detection_lap_finished = True
+        if detection_lap_finished and any(marker in line for marker in markers):
+            lines.append(line)
+    return lines
+
+
+def parse_last_gate_progress(output):
+    gate_progress = None
+    for line in (output or "").splitlines():
+        parsed_progress = parse_gate_progress(line)
+        if parsed_progress is not None:
+            gate_progress = parsed_progress
+    return gate_progress
+
+
+def write_failure_artifacts(
+    result_dir,
+    seed,
+    port,
+    run_index,
+    reason,
+    command,
+    env,
+    output,
+    gate_progress,
+    lap_times,
+    result_file,
+    timeout,
+    mode,
+    include_detection_lap=False,
+    render=False,
+    batch=True,
+):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    failure_dir = result_dir / "failures" / f"seed_{seed}_run_{run_index}_port_{port}_{timestamp}"
+    failure_dir.mkdir(parents=True, exist_ok=True)
+
+    output = output or ""
+    (failure_dir / "webots.log").write_text(output, encoding="utf-8")
+    debug_lines = relevant_debug_lines(output, include_detection_lap=include_detection_lap)
+    (failure_dir / "debug_replay.log").write_text("\n".join(debug_lines) + ("\n" if debug_lines else ""), encoding="utf-8")
+
+    result_payload = None
+    if result_file.exists():
+        try:
+            result_payload = json.loads(result_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            result_payload = {"unparsed_result_file": result_file.read_text(encoding="utf-8", errors="replace")}
+        shutil.copy2(result_file, failure_dir / result_file.name)
+
+    env_snapshot = {
+        "AERIAL_ASSIGNMENT_SEED": env.get("AERIAL_ASSIGNMENT_SEED"),
+        "AERIAL_ASSIGNMENT_QUIT_AFTER_RUN": env.get("AERIAL_ASSIGNMENT_QUIT_AFTER_RUN"),
+        "AERIAL_ASSIGNMENT_RESULT_FILE": env.get("AERIAL_ASSIGNMENT_RESULT_FILE"),
+        "PYTHONPATH": env.get("PYTHONPATH"),
+        "WEBOTS_HOME": env.get("WEBOTS_HOME"),
+    }
+    summary = {
+        "seed": seed,
+        "port": port,
+        "run_index": run_index,
+        "reason": reason,
+        "mode": mode,
+        "batch": batch,
+        "render": render,
+        "timeout": timeout,
+        "command": command,
+        "cwd": str(PROJECT_ROOT),
+        "env": env_snapshot,
+        "gate_progress": gate_progress,
+        "lap_times": lap_times,
+        "result_file": str(result_file),
+        "result_payload": result_payload,
+        "webots_log": str(failure_dir / "webots.log"),
+        "debug_replay_log": str(failure_dir / "debug_replay.log"),
+    }
+    (failure_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return failure_dir
+
+
 def average_columns(rows):
     if not rows:
         return []
@@ -77,7 +185,19 @@ def parse_seed_list(seed_values):
     return seeds
 
 
-def run_one_seed(webots, world, seed, timeout, port, result_dir, mode):
+def run_one_seed(
+    webots,
+    world,
+    seed,
+    timeout,
+    port,
+    result_dir,
+    mode,
+    run_index,
+    include_detection_lap=False,
+    render=False,
+    batch=True,
+):
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"seed_{seed}_port_{port}.json"
     if result_file.exists():
@@ -88,17 +208,13 @@ def run_one_seed(webots, world, seed, timeout, port, result_dir, mode):
     env["AERIAL_ASSIGNMENT_QUIT_AFTER_RUN"] = "1"
     env["AERIAL_ASSIGNMENT_RESULT_FILE"] = str(result_file)
 
-    command = [
-        webots,
-        "--batch",
-        f"--mode={mode}",
-        "--no-rendering",
-        "--minimize",
-        "--stdout",
-        "--stderr",
-        f"--port={port}",
-        str(world),
-    ]
+    command = [webots]
+    if batch:
+        command.append("--batch")
+    command.extend([f"--mode={mode}", "--stdout", "--stderr", f"--port={port}"])
+    if not render:
+        command.extend(["--no-rendering", "--minimize"])
+    command.append(str(world))
 
     try:
         completed = subprocess.run(
@@ -111,14 +227,58 @@ def run_one_seed(webots, world, seed, timeout, port, result_dir, mode):
             timeout=timeout,
             check=False,
         )
+        output = completed.stdout or ""
     except subprocess.TimeoutExpired as exc:
-        if exc.stdout:
-            timeout_output = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
-            for line in timeout_output.splitlines():
-                gate_progress = parse_gate_progress(line)
-                if gate_progress is not None:
-                    return False, "timeout", gate_progress, None, timeout_output
-        return False, "timeout", None, None, ""
+        output = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        if result_file.exists():
+            with result_file.open("r", encoding="utf-8") as file:
+                result = json.load(file)
+            gate_progress = result.get("gate_progress")
+            lap_times = result.get("lap_times")
+            success = bool(result.get("success"))
+            reason = "success" if success else "not all gates passed"
+            failure_dir = None
+            if not success:
+                failure_dir = write_failure_artifacts(
+                    result_dir,
+                    seed,
+                    port,
+                    run_index,
+                    reason,
+                    command,
+                    env,
+                    output,
+                    gate_progress,
+                    lap_times,
+                    result_file,
+                    timeout,
+                    mode,
+                    include_detection_lap=include_detection_lap,
+                    render=render,
+                    batch=batch,
+                )
+            return success, reason, gate_progress, lap_times, output, failure_dir
+
+        gate_progress = parse_last_gate_progress(output)
+        failure_dir = write_failure_artifacts(
+            result_dir,
+            seed,
+            port,
+            run_index,
+            "timeout",
+            command,
+            env,
+            output,
+            gate_progress,
+            None,
+            result_file,
+            timeout,
+            mode,
+            include_detection_lap=include_detection_lap,
+            render=render,
+            batch=batch,
+        )
+        return False, "timeout", gate_progress, None, output, failure_dir
 
     if result_file.exists():
         with result_file.open("r", encoding="utf-8") as file:
@@ -127,24 +287,103 @@ def run_one_seed(webots, world, seed, timeout, port, result_dir, mode):
         lap_times = result.get("lap_times")
         success = bool(result.get("success"))
         reason = "success" if success else "not all gates passed"
-        return success, reason, gate_progress, lap_times, completed.stdout
+        failure_dir = None
+        if not success:
+            failure_dir = write_failure_artifacts(
+                result_dir,
+                seed,
+                port,
+                run_index,
+                reason,
+                command,
+                env,
+                output,
+                gate_progress,
+                lap_times,
+                result_file,
+                timeout,
+                mode,
+                include_detection_lap=include_detection_lap,
+                render=render,
+                batch=batch,
+            )
+        return success, reason, gate_progress, lap_times, output, failure_dir
 
-    gate_progress = None
-    for line in completed.stdout.splitlines():
-        parsed_progress = parse_gate_progress(line)
-        if parsed_progress is not None:
-            gate_progress = parsed_progress
+    gate_progress = parse_last_gate_progress(output)
 
     if gate_progress is None:
-        return False, f"no gate progress output, exit_code={completed.returncode}", gate_progress, None, completed.stdout
+        reason = f"no gate progress output, exit_code={completed.returncode}"
+        failure_dir = write_failure_artifacts(
+            result_dir,
+            seed,
+            port,
+            run_index,
+            reason,
+            command,
+            env,
+            output,
+            gate_progress,
+            None,
+            result_file,
+            timeout,
+            mode,
+            include_detection_lap=include_detection_lap,
+            render=render,
+            batch=batch,
+        )
+        return False, reason, gate_progress, None, output, failure_dir
     if not all_gates_passed(gate_progress):
-        return False, "not all gates passed", gate_progress, None, completed.stdout
-    return True, "success", gate_progress, None, completed.stdout
+        reason = "not all gates passed"
+        failure_dir = write_failure_artifacts(
+            result_dir,
+            seed,
+            port,
+            run_index,
+            reason,
+            command,
+            env,
+            output,
+            gate_progress,
+            None,
+            result_file,
+            timeout,
+            mode,
+            include_detection_lap=include_detection_lap,
+            render=render,
+            batch=batch,
+        )
+        return False, reason, gate_progress, None, output, failure_dir
+    return True, "success", gate_progress, None, output, None
 
 
-def run_seed_job(webots, world, seed, timeout, port, result_dir, mode, run_index, total_runs):
+def run_seed_job(
+    webots,
+    world,
+    seed,
+    timeout,
+    port,
+    result_dir,
+    mode,
+    run_index,
+    total_runs,
+    include_detection_lap,
+    render,
+    batch,
+):
     print(f"Starting run {run_index}/{total_runs}, seed {seed}, port {port}", flush=True)
-    success, reason, gate_progress, lap_times, output = run_one_seed(webots, world, seed, timeout, port, result_dir, mode)
+    success, reason, gate_progress, lap_times, output, failure_dir = run_one_seed(
+        webots,
+        world,
+        seed,
+        timeout,
+        port,
+        result_dir,
+        mode,
+        run_index,
+        include_detection_lap=include_detection_lap,
+        render=render,
+        batch=batch,
+    )
     return {
         "run_index": run_index,
         "seed": seed,
@@ -154,6 +393,7 @@ def run_seed_job(webots, world, seed, timeout, port, result_dir, mode, run_index
         "gate_progress": gate_progress,
         "lap_times": lap_times,
         "output": output,
+        "failure_dir": failure_dir,
     }
 
 
@@ -168,10 +408,22 @@ def main():
     parser.add_argument("--failed-file", type=Path, default=DEFAULT_FAILED_FILE, help="Where to append failing seeds.")
     parser.add_argument("--result-dir", type=Path, default=DEFAULT_RESULT_DIR, help="Temporary per-run result files.")
     parser.add_argument("--port", type=int, default=1235, help="First Webots port to use. Parallel runs use following ports.")
-    parser.add_argument("--parallel", type=int, default=1, help="Number of Webots simulations to run at the same time.")
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=0,
+        help="Number of Webots simulations to run at the same time. Use 0 to run every requested seed in parallel.",
+    )
     parser.add_argument("--mode", default="realtime", choices=["realtime", "fast", "pause"], help="Webots simulation mode.")
     parser.add_argument("--seeds", nargs="*", help="Specific seed(s) to run, separated by spaces or commas.")
     parser.add_argument("--show-output", action="store_true", help="Print full Webots output after each run.")
+    parser.add_argument("--render", action="store_true", help="Do not pass --no-rendering/--minimize to Webots.")
+    parser.add_argument("--no-batch", action="store_true", help="Do not pass --batch to Webots.")
+    parser.add_argument(
+        "--include-detection-lap-logs",
+        action="store_true",
+        help="Include detection-lap lines in failed-run debug_replay.log. Full webots.log is always saved.",
+    )
     args = parser.parse_args()
 
     webots = find_webots(args.webots)
@@ -188,12 +440,21 @@ def main():
     else:
         random_source = random.SystemRandom()
         seeds = [random_source.randint(0, 2**32 - 1) for _ in range(args.runs)]
-    parallel = max(1, args.parallel)
+    if args.parallel < 0:
+        raise ValueError("--parallel must be 0 or greater")
+    parallel = args.runs if args.parallel == 0 else min(args.parallel, args.runs)
     print(f"Running {args.runs} assignment simulations with {webots}")
     print(f"Webots mode: {args.mode}")
+    print(f"Webots batch: {not args.no_batch}")
+    print(f"Webots rendering: {args.render}")
+    if not args.render:
+        print("GPU rendering: disabled (--no-rendering). Webots physics/controller execution is not forced onto GPU.")
+    else:
+        print("GPU rendering: enabled where Webots uses it. Physics/controller execution is still CPU-driven.")
     print(f"Parallel simulations: {parallel}")
     print(f"Using Webots ports {args.port} to {args.port + parallel - 1}")
     print(f"Failed seeds will be saved to {failed_file}")
+    print(f"Failed-run logs will be saved under {result_dir / 'failures'}")
 
     failures = 0
     successful_lap_times = []
@@ -216,6 +477,9 @@ def main():
                 args.mode,
                 next_run_index,
                 args.runs,
+                args.include_detection_lap_logs,
+                args.render,
+                not args.no_batch,
             )
             pending[future] = port
             next_run_index += 1
@@ -246,6 +510,8 @@ def main():
                     f"Run {result['run_index']}/{args.runs}, seed {seed} failed: "
                     f"{result['reason']}. Saved to {failed_file}."
                 )
+                if result["failure_dir"]:
+                    print(f"Failure logs: {result['failure_dir']}")
 
             while next_run_index <= args.runs and available_ports:
                 next_port = available_ports.pop(0)
@@ -261,6 +527,9 @@ def main():
                     args.mode,
                     next_run_index,
                     args.runs,
+                    args.include_detection_lap_logs,
+                    args.render,
+                    not args.no_batch,
                 )
                 pending[next_future] = next_port
                 next_run_index += 1

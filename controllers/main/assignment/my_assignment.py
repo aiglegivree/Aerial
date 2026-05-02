@@ -123,18 +123,30 @@ class MyAssignment:
         self.total_replay_laps = 2
         self.replay_trajectory = []
         self.replay_trajectory_types = []
+        self.replay_trajectory_dirs = []
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
-        self.replay_traj_tol = 0.55
+        self.last_printed_replay_index = None
+        self.last_replay_gate0_debug_time = -999.0
+        self.replay_gate_crossing_armed_key = None
+        self.replay_debug = True
+        self.replay_traj_tol = 0.6
+        self.replay_approach_tol = 0.25
         self.replay_gate_tol = 0.12
-        self.replay_gate_z_tol = 0.2
-        self.replay_traj_z_tol = 0.4
+        self.replay_gate_z_tol = 0.12
+        self.replay_gate_cross_margin = 0.16
+        self.replay_gate_cross_command = 0.45
+        self.replay_gate_align_hold_distance = 0.22
+        self.replay_final_gate_cross_margin = 0.35
+        self.replay_final_gate_cross_command = 0.7
+        self.replay_traj_z_tol = 0.35
         self.replay_lookahead_distance = 2
         self.replay_switch_distance = 0.2
         self.replay_segment_lookahead = 2
         self.replay_xy_step = 2
         self.replay_z_step = 1
         self.replay_approach_distance = 0.35
+        self.replay_min_approach_distance = 0.12
         self.replay_exit_distance = 0.6
 
     def debug_print(self, message, min_interval=0.0):
@@ -973,15 +985,17 @@ class MyAssignment:
         if len(self.learned_gates) < self.expected_gate_count:
             self.replay_trajectory = []
             self.replay_trajectory_types = []
+            self.replay_trajectory_dirs = []
             self.replay_traj_index = 0
             return
 
         trajectory = []
         trajectory_types = []
+        trajectory_dirs = []
         for index, gate_bundle in enumerate(self.learned_gates):
             gate_point = np.array(gate_bundle["gate"], dtype=float)
             heading = gate_bundle.get("heading")
-            if index == 0 or heading is None:
+            if heading is None:
                 previous_gate = np.array(
                     self.learned_gates[(index - 1) % len(self.learned_gates)]["gate"],
                     dtype=float,
@@ -990,15 +1004,14 @@ class MyAssignment:
                 heading = np.arctan2(approach_direction[1], approach_direction[0])
 
             approach_direction = np.array([np.cos(heading), np.sin(heading)], dtype=float)
-            approach_distance = self.replay_approach_distance
-
-            approach_point = gate_point.copy()
-            approach_point[:2] -= approach_distance * approach_direction
+            approach_point = self.replay_approach_point(gate_point, approach_direction)
             exit_point = gate_point.copy()
             exit_point[:2] += self.replay_exit_distance * approach_direction
 
+            direction_list = approach_direction.tolist()
             trajectory.extend([approach_point.tolist(), gate_point.tolist(), exit_point.tolist()])
             trajectory_types.extend(["approach", "gate", "exit"])
+            trajectory_dirs.extend([direction_list, direction_list, direction_list])
 
         if entry_position is not None and trajectory:
             entry_point = np.array(entry_position, dtype=float)
@@ -1006,12 +1019,30 @@ class MyAssignment:
             if np.linalg.norm(first_target - entry_point) > self.replay_switch_distance:
                 trajectory.insert(0, entry_point.tolist())
                 trajectory_types.insert(0, "entry")
+                trajectory_dirs.insert(0, trajectory_dirs[0])
 
         self.replay_lap = 0
         self.replay_trajectory = trajectory
         self.replay_trajectory_types = trajectory_types
+        self.replay_trajectory_dirs = trajectory_dirs
         self.replay_traj_index = 0
         self.last_printed_replay_type = None
+        self.last_printed_replay_index = None
+
+        if self.replay_debug and len(trajectory) >= 3:
+            offset = 1 if trajectory_types and trajectory_types[0] == "entry" else 0
+            first_approach = trajectory[offset]
+            first_gate = trajectory[offset + 1]
+            first_exit = trajectory[offset + 2]
+            first_direction = trajectory_dirs[offset + 1]
+            print(
+                "[assignment replay] gate0 path "
+                f"approach=({first_approach[0]:.2f},{first_approach[1]:.2f},{first_approach[2]:.2f}) "
+                f"gate=({first_gate[0]:.2f},{first_gate[1]:.2f},{first_gate[2]:.2f}) "
+                f"exit=({first_exit[0]:.2f},{first_exit[1]:.2f},{first_exit[2]:.2f}) "
+                f"dir=({first_direction[0]:.2f},{first_direction[1]:.2f})",
+                flush=True,
+            )
 
     def replay_current_tolerance(self):
         if not self.replay_trajectory_types:
@@ -1019,6 +1050,57 @@ class MyAssignment:
         if self.replay_trajectory_types[self.replay_traj_index] == "gate":
             return self.replay_gate_tol
         return self.replay_traj_tol
+
+    def replay_gate_number(self, trajectory_index):
+        if not self.replay_trajectory_types:
+            return None
+        offset = 1 if self.replay_trajectory_types[0] == "entry" else 0
+        relative_index = trajectory_index - offset
+        if relative_index < 0:
+            return None
+        return relative_index // 3
+
+    def replay_target_key(self):
+        return (self.replay_lap, self.replay_traj_index)
+
+    def is_final_replay_gate_target(self):
+        if not self.replay_trajectory_types:
+            return False
+        return (
+            self.replay_lap == self.total_replay_laps - 1
+            and self.replay_trajectory_types[self.replay_traj_index] == "gate"
+            and self.replay_gate_number(self.replay_traj_index) == self.expected_gate_count - 1
+        )
+
+    def replay_segment_index(self, xy_position):
+        relative = np.array(xy_position, dtype=float) - self.arena_center
+        norm = np.linalg.norm(relative)
+        if norm < 1e-6:
+            return -1
+
+        angle = np.arctan2(relative[1] / norm, relative[0] / norm) + np.pi
+        segment_size = np.pi / (self.expected_gate_count + 1)
+        for index in range(self.expected_gate_count + 1):
+            lower = (2 * index - 0.5) * segment_size % (2 * np.pi)
+            upper = (2 * index + 0.5) * segment_size % (2 * np.pi)
+            if index == 0:
+                if angle >= lower or angle <= upper:
+                    return index
+            elif lower <= angle <= upper:
+                return index
+        return -1
+
+    def replay_approach_point(self, gate_point, approach_direction):
+        gate_segment = self.replay_segment_index(gate_point[:2])
+        approach_distance = self.replay_approach_distance
+        while approach_distance >= self.replay_min_approach_distance:
+            approach_point = gate_point.copy()
+            approach_point[:2] -= approach_distance * approach_direction
+            if self.replay_segment_index(approach_point[:2]) == gate_segment:
+                return approach_point
+            approach_distance *= 0.7
+
+        return gate_point.copy()
 
     def replay_target_distance(self, target, current_position):
         target_type = (
@@ -1034,7 +1116,33 @@ class MyAssignment:
         xy_distance = float(np.linalg.norm(target[:2] - current_position[:2]))
         if target_type == "gate":
             z_distance = abs(float(target[2] - current_position[2]))
-            return xy_distance < self.replay_gate_tol and z_distance < self.replay_gate_z_tol
+            if self.replay_trajectory_dirs:
+                direction = np.array(self.replay_trajectory_dirs[self.replay_traj_index][:2], dtype=float)
+                direction_norm = np.linalg.norm(direction)
+                if direction_norm > 1e-6:
+                    direction = direction / direction_norm
+                forward_progress = float(np.dot(current_position[:2] - target[:2], direction))
+                lateral_error = float(
+                    np.linalg.norm((current_position[:2] - target[:2]) - forward_progress * direction)
+                )
+            else:
+                forward_progress = 0.0
+                lateral_error = xy_distance
+            cross_margin = self.replay_gate_cross_margin
+            if self.is_final_replay_gate_target():
+                cross_margin = self.replay_final_gate_cross_margin
+            return (
+                lateral_error < self.replay_gate_tol
+                and z_distance < self.replay_gate_z_tol
+                and forward_progress > cross_margin
+                and self.replay_gate_crossing_armed_key == self.replay_target_key()
+            )
+        if target_type == "approach":
+            z_distance = abs(float(target[2] - current_position[2]))
+            gate_number = self.replay_gate_number(self.replay_traj_index)
+            if gate_number is not None and self.replay_segment_index(current_position[:2]) != gate_number + 1:
+                return False
+            return xy_distance < self.replay_approach_tol and z_distance < self.replay_traj_z_tol
 
         switch_distance = self.replay_current_tolerance()
         if target_type not in ("approach", "gate"):
@@ -1318,8 +1426,11 @@ class MyAssignment:
                 self.replay_traj_index = 0
                 self.replay_lap += 1
                 if self.replay_lap >= self.total_replay_laps:
-                    self.state = "RETURN_HOME"
-                    return self.return_home_command(sensor_data)
+                    # The scorer completes a lap only when the drone moves from
+                    # segment 5 back into segment 0. Keep following the replay
+                    # wrap toward gate 0 so the final lap is credited before the
+                    # controller returns home.
+                    self.replay_lap = self.total_replay_laps
 
         target = np.array(self.replay_trajectory[self.replay_traj_index], dtype=float)
         target_type = (
@@ -1327,15 +1438,64 @@ class MyAssignment:
             if self.replay_trajectory_types
             else None
         )
+        if (
+            self.replay_debug
+            and (
+                self.replay_traj_index != self.last_printed_replay_index
+                or target_type != self.last_printed_replay_type
+            )
+        ):
+            gate_number = self.replay_gate_number(self.replay_traj_index)
+            print(
+                "[assignment replay] "
+                f"lap={self.replay_lap} index={self.replay_traj_index} gate={gate_number} "
+                f"type={target_type} target=({target[0]:.2f},{target[1]:.2f},{target[2]:.2f}) "
+                f"pos=({current_position[0]:.2f},{current_position[1]:.2f},{current_position[2]:.2f})",
+                flush=True,
+            )
+            self.last_printed_replay_index = self.replay_traj_index
+            self.last_printed_replay_type = target_type
         distance = self.replay_target_distance(target, current_position)
         command_target = target
+        target_key = self.replay_target_key()
+        if target_type != "gate" or self.replay_gate_crossing_armed_key != target_key:
+            self.replay_gate_crossing_armed_key = None
+
+        if target_type == "gate" and self.replay_trajectory_dirs:
+            direction_xy = np.array(self.replay_trajectory_dirs[self.replay_traj_index][:2], dtype=float)
+            direction_norm = np.linalg.norm(direction_xy)
+            if direction_norm > 1e-6:
+                direction = np.array(
+                    [
+                        direction_xy[0] / direction_norm,
+                        direction_xy[1] / direction_norm,
+                        0.0,
+                    ],
+                    dtype=float,
+                )
+                cross_command = self.replay_gate_cross_command
+                if self.is_final_replay_gate_target():
+                    cross_command = self.replay_final_gate_cross_command
+                forward_progress = float(np.dot(current_position[:2] - target[:2], direction[:2]))
+                lateral_error = float(
+                    np.linalg.norm((current_position[:2] - target[:2]) - forward_progress * direction[:2])
+                )
+                z_distance = abs(float(target[2] - current_position[2]))
+                if z_distance > self.replay_gate_z_tol or lateral_error > self.replay_gate_tol:
+                    self.replay_gate_crossing_armed_key = None
+                    command_target = target - self.replay_gate_align_hold_distance * direction
+                elif forward_progress > 0.02 and self.replay_gate_crossing_armed_key != target_key:
+                    command_target = target - self.replay_gate_align_hold_distance * direction
+                else:
+                    self.replay_gate_crossing_armed_key = target_key
+                    command_target = target + cross_command * direction
 
         is_final_replay_target = (
             self.replay_lap == self.total_replay_laps - 1
             and self.replay_traj_index == len(self.replay_trajectory) - 1
         )
         if (
-            target_type not in ("gate", "exit")
+            target_type not in ("approach", "gate", "exit")
             and not is_final_replay_target
             and len(self.replay_trajectory) > 1
         ):
@@ -1356,6 +1516,28 @@ class MyAssignment:
 
         z_error = float(command_target[2] - current_position[2])
         command_z = current_position[2] + np.clip(z_error, -self.replay_z_step, self.replay_z_step)
+        if (
+            self.replay_debug
+            and target_type == "gate"
+            and self.replay_gate_number(self.replay_traj_index) == 0
+            and self.time_since_start - self.last_replay_gate0_debug_time > 0.25
+        ):
+            direction = np.array(self.replay_trajectory_dirs[self.replay_traj_index][:2], dtype=float)
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm > 1e-6:
+                direction = direction / direction_norm
+            forward_progress = float(np.dot(current_position[:2] - target[:2], direction))
+            lateral_error = float(
+                np.linalg.norm((current_position[:2] - target[:2]) - forward_progress * direction)
+            )
+            print(
+                "[assignment replay] gate0 gate-target "
+                f"xy_error={distance:.3f} lateral_error={lateral_error:.3f} z_error={z_error:.3f} "
+                f"forward_progress={forward_progress:.3f} "
+                f"command=({command_xy[0]:.2f},{command_xy[1]:.2f},{command_z:.2f})",
+                flush=True,
+            )
+            self.last_replay_gate0_debug_time = self.time_since_start
         return [float(command_xy[0]), float(command_xy[1]), float(command_z), sensor_data["yaw"]]
 
     def return_home_command(self, sensor_data):
